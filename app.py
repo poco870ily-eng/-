@@ -4,7 +4,6 @@ import hmac
 import html
 import json
 import os
-import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -12,14 +11,19 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, jsonify, redirect, request
 
+
 app = Flask(__name__)
+
 
 LINKVERTISE_URL = os.getenv(
     "LINKVERTISE_URL",
     "https://link-hub.net/7774223/AvhFq6Fr49hN"
 ).strip()
 
-LINKVERTISE_TOKEN = os.getenv("LINKVERTISE_TOKEN", "").strip()
+LINKVERTISE_TOKEN = os.getenv(
+    "LINKVERTISE_TOKEN",
+    ""
+).strip()
 
 LINKVERTISE_VERIFY_URL = (
     "https://publisher.linkvertise.com/api/v1/anti_bypassing"
@@ -30,29 +34,38 @@ KEY_TTL_SECONDS = max(
     int(os.getenv("KEY_TTL_SECONDS", "600"))
 )
 
-HASH_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 KEY_PREFIX = "NH1_"
 
 
 def b64url_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+    return base64.urlsafe_b64encode(
+        value
+    ).rstrip(b"=").decode("ascii")
 
 
 def b64url_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
+
+    return base64.urlsafe_b64decode(
+        value + padding
+    )
 
 
-def signing_secret() -> bytes:
-    if len(LINKVERTISE_TOKEN) != 64:
-        raise RuntimeError("LINKVERTISE_TOKEN is not configured")
+def get_signing_secret() -> bytes:
+    if not LINKVERTISE_TOKEN:
+        raise RuntimeError(
+            "LINKVERTISE_TOKEN is not configured"
+        )
 
     return hashlib.sha256(
-        ("nameless-linkvertise:" + LINKVERTISE_TOKEN).encode("utf-8")
+        (
+            "nameless-linkvertise:"
+            + LINKVERTISE_TOKEN
+        ).encode("utf-8")
     ).digest()
 
 
-def create_key() -> tuple[str, int]:
+def create_key():
     expires_at = int(time.time()) + KEY_TTL_SECONDS
 
     payload = {
@@ -66,10 +79,12 @@ def create_key() -> tuple[str, int]:
         sort_keys=True
     ).encode("utf-8")
 
-    encoded_payload = b64url_encode(payload_bytes)
+    encoded_payload = b64url_encode(
+        payload_bytes
+    )
 
     signature = hmac.new(
-        signing_secret(),
+        get_signing_secret(),
         encoded_payload.encode("ascii"),
         hashlib.sha256
     ).digest()
@@ -84,18 +99,30 @@ def create_key() -> tuple[str, int]:
     return key, expires_at
 
 
-def validate_key(key: str) -> tuple[bool, dict]:
-    if not isinstance(key, str) or not key.startswith(KEY_PREFIX):
-        return False, {"error": "invalid_key"}
+def validate_key(key: str):
+    if not isinstance(key, str):
+        return False, {
+            "error": "invalid_key"
+        }
+
+    if not key.startswith(KEY_PREFIX):
+        return False, {
+            "error": "invalid_key"
+        }
 
     try:
-        encoded = key[len(KEY_PREFIX):]
-        encoded_payload, encoded_signature = encoded.split(".", 1)
+        encoded_key = key[len(KEY_PREFIX):]
 
-        received_signature = b64url_decode(encoded_signature)
+        encoded_payload, encoded_signature = (
+            encoded_key.split(".", 1)
+        )
+
+        received_signature = b64url_decode(
+            encoded_signature
+        )
 
         expected_signature = hmac.new(
-            signing_secret(),
+            get_signing_secret(),
             encoded_payload.encode("ascii"),
             hashlib.sha256
         ).digest()
@@ -104,10 +131,16 @@ def validate_key(key: str) -> tuple[bool, dict]:
             received_signature,
             expected_signature
         ):
-            return False, {"error": "invalid_signature"}
+            return False, {
+                "error": "invalid_signature"
+            }
+
+        payload_bytes = b64url_decode(
+            encoded_payload
+        )
 
         payload = json.loads(
-            b64url_decode(encoded_payload).decode("utf-8")
+            payload_bytes.decode("utf-8")
         )
 
         expires_at = int(payload["exp"])
@@ -121,14 +154,20 @@ def validate_key(key: str) -> tuple[bool, dict]:
 
         return True, {
             "expires_at": expires_at,
-            "remaining_seconds": expires_at - current_time
+            "remaining_seconds": (
+                expires_at - current_time
+            )
         }
 
     except Exception:
-        return False, {"error": "invalid_key"}
+        return False, {
+            "error": "invalid_key"
+        }
 
 
-def parse_linkvertise_response(response: requests.Response):
+def parse_linkvertise_response(
+    response: requests.Response
+):
     raw_text = response.text.strip()
 
     try:
@@ -137,27 +176,49 @@ def parse_linkvertise_response(response: requests.Response):
         parsed = raw_text
 
     if isinstance(parsed, bool):
-        return parsed, "verified" if parsed else "hash_not_found"
+        if parsed:
+            return True, "verified"
+
+        return False, "hash_not_found"
 
     if isinstance(parsed, dict):
-        candidate = parsed.get("valid")
+        for field_name in (
+            "valid",
+            "success",
+            "verified",
+            "data",
+            "result"
+        ):
+            candidate = parsed.get(field_name)
 
-        if candidate is None:
-            candidate = parsed.get("success")
+            if isinstance(candidate, bool):
+                if candidate:
+                    return True, "verified"
 
-        if candidate is None:
-            candidate = parsed.get("data")
+                return False, "hash_not_found"
 
-        if isinstance(candidate, bool):
-            return (
-                candidate,
-                "verified" if candidate else "hash_not_found"
-            )
+            if isinstance(candidate, str):
+                normalized = (
+                    candidate
+                    .strip()
+                    .strip('"')
+                    .lower()
+                )
 
-        if candidate is not None:
-            parsed = candidate
+                if normalized == "true":
+                    return True, "verified"
 
-    normalized = str(parsed).strip().strip('"').lower()
+                if normalized == "false":
+                    return False, "hash_not_found"
+
+        parsed = json.dumps(parsed)
+
+    normalized = (
+        str(parsed)
+        .strip()
+        .strip('"')
+        .lower()
+    )
 
     if normalized == "true":
         return True, "verified"
@@ -172,11 +233,30 @@ def parse_linkvertise_response(response: requests.Response):
 
 
 def verify_linkvertise_hash(hash_value: str):
-    if len(LINKVERTISE_TOKEN) != 64:
+    if not LINKVERTISE_TOKEN:
         return False, "token_not_configured"
 
-    if not HASH_PATTERN.fullmatch(hash_value or ""):
-        return False, "invalid_hash_format"
+    if len(LINKVERTISE_TOKEN) != 64:
+        app.logger.warning(
+            "LINKVERTISE_TOKEN length is %s instead of 64",
+            len(LINKVERTISE_TOKEN)
+        )
+
+    if not isinstance(hash_value, str):
+        return False, "invalid_hash"
+
+    hash_value = hash_value.strip()
+
+    if not hash_value:
+        return False, "hash_missing"
+
+    if len(hash_value) > 512:
+        return False, "invalid_hash"
+
+    app.logger.info(
+        "Checking Linkvertise hash with length %s",
+        len(hash_value)
+    )
 
     try:
         response = requests.post(
@@ -186,20 +266,30 @@ def verify_linkvertise_hash(hash_value: str):
                 "hash": hash_value
             },
             headers={
-                "Accept": "application/json, text/plain, */*",
-                "User-Agent": "Nameless-Linkvertise-Test/1.0"
+                "Accept": (
+                    "application/json,"
+                    " text/plain,"
+                    " */*"
+                ),
+                "User-Agent": (
+                    "Nameless-Linkvertise-Test/1.0"
+                )
             },
-            timeout=(3, 6)
+            timeout=(3, 7)
+        )
+
+        app.logger.info(
+            "Linkvertise API status=%s response=%r",
+            response.status_code,
+            response.text[:200]
         )
 
         if not response.ok:
-            app.logger.warning(
-                "Linkvertise returned HTTP %s",
-                response.status_code
-            )
             return False, "linkvertise_http_error"
 
-        return parse_linkvertise_response(response)
+        return parse_linkvertise_response(
+            response
+        )
 
     except requests.Timeout:
         return False, "linkvertise_timeout"
@@ -207,23 +297,30 @@ def verify_linkvertise_hash(hash_value: str):
     except requests.RequestException as error:
         app.logger.warning(
             "Linkvertise request failed: %s",
-            type(error).__name__
+            str(error)
         )
+
         return False, "linkvertise_unavailable"
 
 
-def render_page(title: str, content: str, status: int = 200):
+def render_page(
+    title: str,
+    content: str,
+    status: int = 200
+):
     safe_title = html.escape(title)
 
-    document = f"""
+    page = f"""
 <!doctype html>
 <html lang="ru">
 <head>
     <meta charset="utf-8">
+
     <meta
         name="viewport"
-        content="width=device-width,initial-scale=1,maximum-scale=1"
+        content="width=device-width, initial-scale=1"
     >
+
     <title>{safe_title}</title>
 
     <style>
@@ -256,7 +353,9 @@ def render_page(title: str, content: str, status: int = 200):
             border: 1px solid #252525;
             border-radius: 18px;
             background: #0b0b0b;
-            box-shadow: 0 20px 70px rgba(0, 0, 0, .55);
+            box-shadow:
+                0 20px 70px
+                rgba(0, 0, 0, 0.55);
         }}
 
         h1 {{
@@ -287,7 +386,7 @@ def render_page(title: str, content: str, status: int = 200):
             cursor: pointer;
         }}
 
-        .secondary {{
+        .button.secondary {{
             color: #ffffff;
             background: #181818;
             border: 1px solid #292929;
@@ -343,47 +442,64 @@ def render_page(title: str, content: str, status: int = 200):
 </html>
 """
 
-    return document, status, {
+    return page, status, {
         "Content-Type": "text/html; charset=utf-8"
     }
 
 
 @app.after_request
-def disable_cache(response):
+def add_security_headers(response):
     response.headers["Cache-Control"] = (
-        "no-store, no-cache, must-revalidate, max-age=0"
+        "no-store, no-cache, "
+        "must-revalidate, max-age=0"
     )
+
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
+
+    response.headers[
+        "X-Content-Type-Options"
+    ] = "nosniff"
+
+    response.headers[
+        "X-Frame-Options"
+    ] = "DENY"
+
+    response.headers[
+        "Referrer-Policy"
+    ] = "no-referrer"
+
     return response
 
 
 @app.get("/")
 def index():
-    token_configured = len(LINKVERTISE_TOKEN) == 64
+    token_configured = bool(
+        LINKVERTISE_TOKEN
+    )
 
     if token_configured:
-        status_text = (
-            '<span class="status success">Anti-Bypass настроен</span>'
-        )
+        token_status = """
+            <span class="status success">
+                Anti-Bypass настроен
+            </span>
+        """
     else:
-        status_text = (
-            '<span class="status error">'
-            'LINKVERTISE_TOKEN не настроен'
-            '</span>'
-        )
+        token_status = """
+            <span class="status error">
+                LINKVERTISE_TOKEN не настроен
+            </span>
+        """
 
     content = f"""
-        {status_text}
+        {token_status}
 
         <h1>Linkvertise Test</h1>
 
         <p>
-            Пройди Linkvertise. После подтверждения сервер проверит
-            одноразовый hash через Anti-Bypass API и выдаст тестовый ключ.
+            Пройди Linkvertise. После завершения
+            сервер проверит одноразовый hash через
+            Anti-Bypass API и выдаст тестовый ключ.
         </p>
 
         <a class="button" href="/go">
@@ -391,86 +507,146 @@ def index():
         </a>
 
         <small>
-            Ключ действует {KEY_TTL_SECONDS // 60} мин.
+            Ключ действует
+            {KEY_TTL_SECONDS // 60} минут.
         </small>
     """
 
-    return render_page("Linkvertise Test", content)
+    return render_page(
+        "Linkvertise Test",
+        content
+    )
 
 
 @app.get("/go")
 def go_to_linkvertise():
-    if not LINKVERTISE_URL.startswith(("https://", "http://")):
+    if not LINKVERTISE_URL.startswith(
+        ("https://", "http://")
+    ):
         return render_page(
             "Ошибка",
             """
-                <span class="status error">Ошибка конфигурации</span>
+                <span class="status error">
+                    Ошибка конфигурации
+                </span>
+
                 <h1>Неверный LINKVERTISE_URL</h1>
-                <p>Проверь переменную окружения в Render.</p>
+
+                <p>
+                    Проверь переменную окружения
+                    LINKVERTISE_URL в Render.
+                </p>
             """,
             500
         )
 
-    return redirect(LINKVERTISE_URL, code=302)
+    return redirect(
+        LINKVERTISE_URL,
+        code=302
+    )
 
 
 @app.get("/linkvertise/callback")
 def linkvertise_callback():
-    hash_value = request.args.get("hash", "").strip()
+    hash_value = request.args.get(
+        "hash",
+        ""
+    )
 
     if not hash_value:
         return render_page(
             "Проверка не пройдена",
             """
-                <span class="status error">Hash отсутствует</span>
+                <span class="status error">
+                    Hash отсутствует
+                </span>
 
                 <h1>Ссылка открыта напрямую</h1>
 
                 <p>
-                    Linkvertise не передал подтверждающий hash.
-                    Сначала необходимо пройти рекламный этап.
+                    Linkvertise не передал hash.
+                    Сначала необходимо полностью
+                    пройти рекламный этап.
                 </p>
 
-                <a class="button secondary" href="/">
+                <a
+                    class="button secondary"
+                    href="/"
+                >
                     Попробовать снова
                 </a>
             """,
             403
         )
 
-    verified, reason = verify_linkvertise_hash(hash_value)
+    verified, reason = (
+        verify_linkvertise_hash(
+            hash_value
+        )
+    )
 
     if not verified:
         reason_names = {
-            "invalid_hash_format": "Неверный формат hash",
-            "hash_not_found": "Hash не найден или уже использован",
-            "invalid_token": "Неверный Anti-Bypass Token",
-            "token_not_configured": "Token не настроен",
-            "linkvertise_timeout": "Linkvertise не ответил вовремя",
-            "linkvertise_unavailable": "Linkvertise временно недоступен",
-            "linkvertise_http_error": "Ошибка API Linkvertise",
-            "unexpected_response": "Неизвестный ответ Linkvertise"
+            "hash_missing": (
+                "Linkvertise не передал hash"
+            ),
+            "invalid_hash": (
+                "Получен некорректный hash"
+            ),
+            "hash_not_found": (
+                "Hash не найден, истёк "
+                "или уже был использован"
+            ),
+            "invalid_token": (
+                "Неверный Anti-Bypass Token"
+            ),
+            "token_not_configured": (
+                "Anti-Bypass Token не настроен"
+            ),
+            "linkvertise_timeout": (
+                "Linkvertise не ответил вовремя"
+            ),
+            "linkvertise_unavailable": (
+                "Linkvertise временно недоступен"
+            ),
+            "linkvertise_http_error": (
+                "API Linkvertise вернул ошибку"
+            ),
+            "unexpected_response": (
+                "Получен неизвестный ответ "
+                "от Linkvertise"
+            )
         }
 
-        safe_reason = html.escape(
-            reason_names.get(reason, "Проверка не пройдена")
+        message = reason_names.get(
+            reason,
+            "Проверка не пройдена"
+        )
+
+        safe_message = html.escape(
+            message
         )
 
         return render_page(
             "Проверка не пройдена",
             f"""
-                <span class="status error">Anti-Bypass отклонил запрос</span>
+                <span class="status error">
+                    Anti-Bypass отклонил запрос
+                </span>
 
                 <h1>Доступ не подтверждён</h1>
 
-                <p>{safe_reason}.</p>
+                <p>{safe_message}.</p>
 
                 <p>
-                    Не обновляй callback-страницу: hash одноразовый.
+                    Не обновляй эту страницу.
                     Начни прохождение заново.
                 </p>
 
-                <a class="button secondary" href="/">
+                <a
+                    class="button secondary"
+                    href="/"
+                >
                     Пройти заново
                 </a>
             """,
@@ -479,15 +655,21 @@ def linkvertise_callback():
 
     try:
         key, expires_at = create_key()
+
     except RuntimeError:
         return render_page(
             "Ошибка сервера",
             """
-                <span class="status error">Ошибка конфигурации</span>
+                <span class="status error">
+                    Ошибка конфигурации
+                </span>
 
                 <h1>Ключ не создан</h1>
 
-                <p>На сервере не настроен LINKVERTISE_TOKEN.</p>
+                <p>
+                    На сервере не настроен
+                    LINKVERTISE_TOKEN.
+                </p>
             """,
             500
         )
@@ -495,66 +677,101 @@ def linkvertise_callback():
     expires_text = datetime.fromtimestamp(
         expires_at,
         tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
     safe_key = html.escape(key)
-    safe_expiration = html.escape(expires_text)
+
+    safe_expiration = html.escape(
+        expires_text
+    )
 
     content = f"""
-        <span class="status success">Проверка пройдена</span>
+        <span class="status success">
+            Проверка пройдена
+        </span>
 
         <h1>Ключ получен</h1>
 
         <p>
-            Linkvertise подтвердил прохождение. Ключ действует до
+            Linkvertise подтвердил прохождение.
+            Ключ действует до
             {safe_expiration}.
         </p>
 
-        <div class="key" id="key">{safe_key}</div>
+        <div class="key" id="key">
+            {safe_key}
+        </div>
 
-        <button class="button" onclick="copyKey()">
+        <button
+            class="button"
+            onclick="copyKey(this)"
+        >
             Скопировать ключ
         </button>
 
-        <a class="button secondary" href="/">
+        <a
+            class="button secondary"
+            href="/"
+        >
             На главную
         </a>
 
         <script>
-            async function copyKey() {{
-                const key = document
-                    .getElementById("key")
-                    .textContent
-                    .trim();
+            async function copyKey(button) {{
+                const keyElement =
+                    document.getElementById("key");
+
+                const key =
+                    keyElement.textContent.trim();
 
                 try {{
-                    await navigator.clipboard.writeText(key);
-                    event.target.textContent = "Скопировано";
-                }} catch (_) {{
-                    const range = document.createRange();
-                    range.selectNode(
-                        document.getElementById("key")
+                    await navigator.clipboard.writeText(
+                        key
                     );
 
-                    const selection = window.getSelection();
+                    button.textContent =
+                        "Скопировано";
+                }} catch (error) {{
+                    const range =
+                        document.createRange();
+
+                    range.selectNodeContents(
+                        keyElement
+                    );
+
+                    const selection =
+                        window.getSelection();
+
                     selection.removeAllRanges();
                     selection.addRange(range);
 
                     document.execCommand("copy");
+
                     selection.removeAllRanges();
 
-                    event.target.textContent = "Скопировано";
+                    button.textContent =
+                        "Скопировано";
                 }}
             }}
         </script>
     """
 
-    return render_page("Ключ получен", content)
+    return render_page(
+        "Ключ получен",
+        content
+    )
 
 
-@app.route("/api/validate-key", methods=["GET", "POST"])
+@app.route(
+    "/api/validate-key",
+    methods=["GET", "POST"]
+)
 def api_validate_key():
-    body = request.get_json(silent=True)
+    body = request.get_json(
+        silent=True
+    )
 
     if not isinstance(body, dict):
         body = {}
@@ -566,44 +783,70 @@ def api_validate_key():
         or ""
     )
 
-    valid, result = validate_key(str(key).strip())
+    valid, result = validate_key(
+        str(key).strip()
+    )
 
-    response = {
+    response_data = {
         "success": valid,
         "valid": valid
     }
 
-    response.update(result)
+    response_data.update(result)
 
-    return jsonify(response), 200 if valid else 401
+    if valid:
+        return jsonify(
+            response_data
+        ), 200
+
+    return jsonify(
+        response_data
+    ), 401
 
 
 @app.get("/health")
 def health():
     return jsonify({
         "ok": True,
-        "linkvertise_url_configured": bool(LINKVERTISE_URL),
-        "anti_bypass_token_configured": (
-            len(LINKVERTISE_TOKEN) == 64
+        "linkvertise_url": LINKVERTISE_URL,
+        "linkvertise_url_configured": bool(
+            LINKVERTISE_URL
+        ),
+        "anti_bypass_token_configured": bool(
+            LINKVERTISE_TOKEN
+        ),
+        "anti_bypass_token_length": len(
+            LINKVERTISE_TOKEN
         )
     })
 
 
 @app.errorhandler(404)
-def not_found(_):
+def not_found(_error):
     return render_page(
         "Не найдено",
         """
-            <span class="status error">404</span>
+            <span class="status error">
+                404
+            </span>
+
             <h1>Страница не найдена</h1>
-            <a class="button secondary" href="/">На главную</a>
+
+            <a
+                class="button secondary"
+                href="/"
+            >
+                На главную
+            </a>
         """,
         404
     )
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
+    port = int(
+        os.getenv("PORT", "10000")
+    )
 
     app.run(
         host="0.0.0.0",
